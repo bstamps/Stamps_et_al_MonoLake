@@ -1,0 +1,465 @@
+---
+title: "The Metabolic Capability and Phylogenetic Diversity of Mono Lake During a Bloom of Picocystis strain ML "
+output: html_notebook
+---
+
+Introduction
+======
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code.
+
+
+First, I process the raw data are processed using QIIME and UPARSE (https://www.drive5.com/uparse/). I usually run the below outside of a Markdown notebook, but for clarity and simplicity I've included them below. Depending on your computer you may have problems running more memory intensive steps, e.g. taxonomy assignment and sequence alignment. For QIIME and UPARSE we used a 16 core (2x 8 core Intel Xeon) / 128 GB RAM workstation, running Ubuntu 16.10. 
+
+You will need the initial mapping file for QC, as well as the mapping (Both included in the github repository as well as supplemental data) file to recreate this analysis.
+
+Software used: 
+- QIIME 1.9.1 (http://qiime.org/)
+- UPARSE (https://www.drive5.com/uparse/)
+- PEAR (https://bioconda.github.io/recipes/pear/README.html)
+- All dependencies for the above software
+
+Initial Pre-Processing
+====
+
+I keep QIIME in a virtual environment to keep everyone else happy on the workstation 
+
+```{bash}
+source activate qiime1
+```
+
+The first block will extract sequence data from the R1 and R2 FASTQ files, ready for input into split_libraries_fastq. Our sequencing approach is non-directional, thus the need for checking both R1 and R2 files. Post extraction, we'll concatenate togther (cat) the barcode and read files so we only have to run split_libraries_fastq one time.
+
+```{bash}
+pear -f seq/ngs-9y64x548t1_S1_L001_R1_001.fastq -r seq/ngs-9y64x548t1_S1_L001_R2_001.fastq -o seq/ML -p 0.001 -v 50 -m 450 -n 250 -y 500m -j 16
+```
+
+```{bash}
+cat seq/ML.unassembled.* > seq/ML.Un.fastq
+
+extract_barcodes.py -a -m map.txt -f seq/ML.assembled.fastq -a -m map.txt -l 12 -o seq/PrepJoin/
+
+extract_barcodes.py -f seq/ML.Un.fastq -l 12 -o seq/PrepUn/
+
+```
+
+Onto demultiplexing. A minimum q-score of 20 was set to limit erronous basecalling as an issue downstream with deblur. Post split libraries the histograms were inspected, and a trim length of 210 bp was chosen for deblur. This length is a tradeoff for sequencing depth and taxonomic resolution. Greater than 90 percent of all reads were recovered post QC for entry into the deblur workflow.
+```{bash}
+split_libraries_fastq.py --barcode_type 12 -i seq/PrepJoin/reads.fastq -b seq/PrepJoin/barcodes.fastq -m map.txt --phred_quality_threshold 0 --store_demultiplexed_fastq -o seq/SlOutJoin/
+
+split_libraries_fastq.py --barcode_type 12 -i seq/PrepUn/reads.fastq -b seq/PrepUn/barcodes.fastq -m map.txt --phred_quality_threshold 0 --store_demultiplexed_fastq -o seq/SlOutUn/
+```
+
+OTU Clustering and Taxonomy Assignment
+=====
+
+
+```{bash}
+mkdir UPARSE
+mkdir UPARSE/Join/
+usearch64 -fastq_stats seq/SlOutJoin/seqs.fastq -log UPARSE/Join/seqs.stats.log
+usearch64 -fastq_filter seq/SlOutJoin/seqs.fastq -fastaout UPARSE/Join/seqs.filtered.fasta -fastq_maxee 1 -threads 16
+usearch64 -derep_fulllength UPARSE/Join/seqs.filtered.fasta  -fastaout UPARSE/Join/seqs.filtered.derep.fasta -sizeout -threads 16
+usearch64 -sortbysize UPARSE/Join/seqs.filtered.derep.fasta -minsize 3 -fastaout UPARSE/Join/seqs.filtered.derep.mc2.fasta
+usearch64 -cluster_otus UPARSE/Join/seqs.filtered.derep.mc2.fasta -otus UPARSE/Join/seqs.filtered.derep.mc2.repset.fasta
+usearch64 -uchime_ref UPARSE/Join/seqs.filtered.derep.mc2.repset.fasta -db /media/analyses/DB/gold.fasta  -strand plus -nonchimeras UPARSE/Join/seqs.filtered.derep.mc2.repset.nochimeras.fasta -threads 16
+fasta_number.py UPARSE/Join/seqs.filtered.derep.mc2.repset.nochimeras.fasta OTU_ > UPARSE/Join/seqs.filtered.derep.mc2.repset.nochimeras.OTUs.fasta
+cp UPARSE/Join/seqs.filtered.derep.mc2.repset.nochimeras.OTUs.fasta UPARSE/Join/RepSet.fna
+usearch64 -usearch_global seq/SlOutJoin/seqs.fna -db UPARSE/Join/seqs.filtered.derep.mc2.repset.nochimeras.OTUs.fasta -strand plus -id 0.97 -uc UPARSE/Join/otu.map.uc -threads 16
+python /home/lab/.conda/envs/qiime1/bin/uc2otutab.py UPARSE/Join/otu.map.uc > UPARSE/Join/seqs.filtered.derep.mc2.repset.nochimeras.OTU-table.txt
+assign_taxonomy.py -m mothur -t /media/analyses/DB/silva.nr_v128.tax -r /media/analyses/DB/silva.nr_v128.align -o UPARSE/Join/mothur_taxonomy/ -i UPARSE/Join/RepSet.fna
+biom convert --table-type="OTU table" -i UPARSE/Join/seqs.filtered.derep.mc2.repset.nochimeras.OTU-table.txt -o UPARSE/Join/UPARSE.biom --to-json
+biom add-metadata --sc-separated taxonomy --observation-header OTUID,taxonomy --observation-metadata-fp UPARSE/Join/mothur_taxonomy/RepSet_tax_assignments.txt -i UPARSE/Join/UPARSE.biom -o UPARSE/Join/UPARSE_w_tax.biom 
+biom add-metadata -i UPARSE/Join/UPARSE_w_tax.biom -o UPARSE/Join/UPARSE.w_md.biom --sample-metadata-fp map.txt
+filter_samples_from_otu_table.py -m map.txt -s 'SampleType:Control' -n 200 -o UPARSE/Join/Control.biom -i UPARSE/Join/UPARSE.w_md.biom
+compute_core_microbiome.py --min_fraction_for_core 0.25 --max_fraction_for_core 0.95 -i UPARSE/Join/Control.biom -o UPARSE/Join/ControlCore/
+```
+
+```{bash}
+mkdir UPARSE/Un/
+usearch64 -fastq_stats seq/SlOutUn/seqs.fastq -log UPARSE/Un/seqs.stats.log
+usearch64 -fastq_filter seq/SlOutUn/seqs.fastq -fastaout UPARSE/Un/seqs.filtered.fasta -fastq_maxee 1 -threads 16
+usearch64 -derep_fulllength UPARSE/Un/seqs.filtered.fasta  -fastaout UPARSE/Un/seqs.filtered.derep.fasta -sizeout -threads 16
+usearch64 -sortbysize UPARSE/Un/seqs.filtered.derep.fasta -minsize 3 -fastaout UPARSE/Un/seqs.filtered.derep.mc2.fasta
+usearch64 -cluster_otus UPARSE/Un/seqs.filtered.derep.mc2.fasta -otus UPARSE/Un/seqs.filtered.derep.mc2.repset.fasta
+usearch64 -uchime_ref UPARSE/Un/seqs.filtered.derep.mc2.repset.fasta -db /media/analyses/DB/gold.fasta  -strand plus -nonchimeras UPARSE/Un/seqs.filtered.derep.mc2.repset.nochimeras.fasta -threads 16
+fasta_number.py UPARSE/Un/seqs.filtered.derep.mc2.repset.nochimeras.fasta OTU_ > UPARSE/Un/seqs.filtered.derep.mc2.repset.nochimeras.OTUs.fasta
+cp UPARSE/Un/seqs.filtered.derep.mc2.repset.nochimeras.OTUs.fasta UPARSE/Un/RepSet.fna
+usearch64 -usearch_global seq/SlOutUn/seqs.fna -db UPARSE/Un/seqs.filtered.derep.mc2.repset.nochimeras.OTUs.fasta -strand plus -id 0.97 -uc UPARSE/Un/otu.map.uc -threads 16
+python /home/lab/.conda/envs/qiime1/bin/uc2otutab.py UPARSE/Un/otu.map.uc > UPARSE/Un/seqs.filtered.derep.mc2.repset.nochimeras.OTU-table.txt
+assign_taxonomy.py -m mothur -t /media/analyses/DB/silva.nr_v128.tax -r /media/analyses/DB/silva.nr_v128.align -o UPARSE/Un/mothur_taxonomy/ -i UPARSE/Un/RepSet.fna
+biom convert --table-type="OTU table" -i UPARSE/Un/seqs.filtered.derep.mc2.repset.nochimeras.OTU-table.txt -o UPARSE/Un/UPARSE.biom --to-json
+biom add-metadata --sc-separated taxonomy --observation-header OTUID,taxonomy --observation-metadata-fp UPARSE/Un/mothur_taxonomy/RepSet_tax_assignments.txt -i UPARSE/Un/UPARSE.biom -o UPARSE/Un/UPARSE_w_tax.biom 
+biom add-metadata -i UPARSE/Un/UPARSE_w_tax.biom -o UPARSE/Un/UPARSE.w_md.biom --sample-metadata-fp map.txt
+filter_samples_from_otu_table.py -m map.txt -s 'SampleType:Control' -n 500 -o UPARSE/Un/Control.biom -i UPARSE/Un/UPARSE.w_md.biom
+compute_core_microbiome.py --min_fraction_for_core 0.25 --max_fraction_for_core 0.75 -i UPARSE/Un/Control.biom -o UPARSE/Un/ControlCore/
+```
+
+Contamination Screening
+====
+
+A filter file was created from the OTUs found to be in 75 percent of my controls. This should be a pretty conservative filter of the most abundant contaminants found across my samples. 
+```{bash}
+filter_otus_from_otu_table.py -e UPARSE/Join/ControlCore/core_otus_95.txt -s 3 -n 1 -i UPARSE/Join/UPARSE_w_tax.biom  -o UPARSE/Join/PostControlFilter.biom
+filter_samples_from_otu_table.py --sample_id_fp AnalysisMap.txt -n 500 -i UPARSE/Join/PostControlFilter.biom -o UPARSE/Join/Analysis.biom
+filter_taxa_from_otu_table.py -n Eukaryota -i UPARSE/Join/Analysis.biom -o UPARSE/Analysis_BacArc.biom
+
+filter_samples_from_otu_table.py --sample_id_fp AnalysisMap.txt -n 500 -i UPARSE/Un/UPARSE_w_tax.biom -o UPARSE/Un/Analysis.biom
+filter_taxa_from_otu_table.py -p Eukaryota -i UPARSE/Un/Analysis.biom -o UPARSE/Analysis_Euk.biom
+```
+
+Before moving on, I want to generate some summaries to see how many sequences I have left overall, and how many SVs were retained/removed after filtering.
+
+```{bash}
+biom summarize-table -i UPARSE/Join/UPARSE_w_tax.biom -o Join_all_w_tax_summary.txt
+biom summarize-table -i UPARSE/Join/PostControlFilter.biom -o Join_PostControlFilter_summary.txt
+biom summarize-table -i UPARSE/Join/Analysis.biom -o Join_Analysis_summary.txt
+biom summarize-table -i UPARSE/Analysis_BacArc.biom -o Analysis_BacArc_summary.txt
+
+biom summarize-table -i UPARSE/Un/UPARSE_w_tax.biom -o Un_all_w_tax_summary.txt
+biom summarize-table -i UPARSE/Un/Analysis.biom -o Un_Analysis_summary.txt
+biom summarize-table -i UPARSE/Analysis_Euk.biom -o Analysis_Euk_summary.txt
+```
+
+What does this look like? 
+
+Unfiltered BIOM, post clustering: 601 OTUs, 724155 Sequences
+Post contaminant filtration: 569 OTUs, 634641 Sequences 
+Post removal of control samples: 569 OTUs, 615813 Sequences
+Excluding Eukaryotic Sequence: 566 OTUs, 615518 Sequences
+
+Counts/sample summary:
+ Min: 1735.0
+ Max: 25105.0
+ Median: 7987.500
+ Mean: 8230.212
+ Std. dev.: 3413.020
+ 
+Unfiltered BIOM, post clustering: 317 OTUs, 82062 Sequences
+Post removal of control samples: 317 OTUs, 81281 Sequences
+Excluding Bacterial and Archaeal Sequence: 265 OTUs, 79430 Sequences
+
+Counts/sample summary:
+ Min: 480.0
+ Max: 3333.0
+ Median: 1338.500
+ Mean: 1527.500
+ Std. dev.: 742.038
+
+
+So, the vast majority of my sequence is non-eukarytoic. Otherwise, roughly 20 percent of the clustered OTUs were removed during contaminant filtering, but the vast majority (> 90 %) of seqeunce was retained. 
+
+Next, I'll add sample metadata to each file, and then convert my two analysis BIOM files to JSON format for use in Phyloseq/R
+
+```{bash}
+biom add-metadata -i UPARSE/Analysis_BacArc.biom -o UPARSE/Analysis_BacArc.w_md.biom --sample-metadata-fp R_metadata.txt
+biom convert -i UPARSE/Analysis_BacArc.w_md.biom -o UPARSE/BacArc.w_md.json.biom --table-type="OTU table" --to-json
+
+biom add-metadata -i UPARSE/Analysis_Euk.biom -o UPARSE/Analysis_Euk.w_md.biom --sample-metadata-fp R_metadata.txt
+biom convert -i UPARSE/Analysis_Euk.w_md.biom -o UPARSE/Euk.w_md.json.biom --table-type="OTU table" --to-json
+```
+
+Tree Building and Final BIOM File Generation
+=====
+
+Last step before moving into R. Generation of phylogenetic trees for use in Phyloseq, as needed. 
+
+```{bash}
+filter_fasta.py -b UPARSE/Analysis_BacArc.biom -f UPARSE/Join/RepSet.fna -o UPARSE/Analysis_BacArc.seqs.fa 
+
+filter_fasta.py -b UPARSE/Analysis_Euk.biom -f UPARSE/Un/RepSet.fna -o UPARSE/Analysis_Euk.seqs.fa
+```
+
+```{bash}
+align_seqs.py -i UPARSE/Analysis_BacArc.seqs.fa -t /media/analyses/DB/SILVA_128_QIIME_release/rep_set_aligned/97/97_otus_aligned.fasta -o UPARSE/Analysis_BacArc_RepSet_Aligned/
+align_seqs.py -i UPARSE/Analysis_Euk.seqs.fa  -t /media/analyses/DB/SILVA_128_QIIME_release/rep_set_aligned/97/97_otus_aligned.fasta -o UPARSE/Analysis_Euk_RepSet_Aligned/
+
+filter_alignment.py -i UPARSE/Analysis_BacArc_RepSet_Aligned/Analysis_BacArc.seqs_aligned.fasta -o UPARSE/Analysis_BacArc_RepSet_Aligned/ -e 0.001
+filter_alignment.py -i UPARSE/Analysis_Euk_RepSet_Aligned/Analysis_Euk.seqs_aligned.fasta -o UPARSE/Analysis_Euk_RepSet_Aligned/ -e 0.001
+
+make_phylogeny.py -i UPARSE/Analysis_BacArc_RepSet_Aligned/Analysis_BacArc.seqs_aligned_pfiltered.fasta -o UPARSE/BacArc.tre
+make_phylogeny.py -i UPARSE/Analysis_Euk_RepSet_Aligned/Analysis_Euk.seqs_aligned_pfiltered.fasta -o UPARSE/Euk.tre
+```
+
+Analysis in R
+
+=====
+
+Onto R. This can be run on (almost) any desktop/laptop without issue. In my case, I downloaded the above output files (.biom, .tre. and .fa) from my workstation onto my laptop to run the below. 
+
+Load Needed Libraries
+```{r, message=FALSE, warning=FALSE}
+library(phyloseq)
+library(ampvis)
+library(cowplot)
+```
+
+First, I'm going to import the my BIOM files, and format the taxonomy string to behave with Phyloseq and AmpVis.
+
+```{r}
+ML.BacArc <- import_biom("BacArc.w_md.json.biom", "BacArc.tre", "Analysis_BacArc.seqs.fa", parseFunction=parse_taxonomy_default)
+ML.Euk <- import_biom("Euk.w_md.json.biom", "Euk.tre", "Analysis_Euk.seqs.fa", parseFunction=parse_taxonomy_default)
+
+colnames(tax_table(ML.BacArc)) = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus")
+colnames(tax_table(ML.Euk)) = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus")
+```
+
+Next, I'll subset my Phyloseq objects to exclude incubation samples. You can see the results of the incubations in supplementary data.
+```{r}
+ML.wChloroplast.BacArc <- subset_samples(ML.BacArc, SampleName %in% c("MonoLake.SurfaceWater", "MonoLake.2m", "MonoLake.10m", "MonoLake.20m","MonoLake.25m", "MonoLake.Sed.10m", "TomsWell.Water", "LeeViningCreek.RiverWater", "MillCreek.RiverWater", "RushCreek.RiverWater", "WilsonCreek.RiverWater"))
+
+ML.RA.wChloroplast.BacArc <- transform_sample_counts(ML.wChloroplast.BacArc, function(x) x / sum(x) * 100)
+```
+
+As a small step, chloroplast and mitochondial sequence need to be removed from the Bacterial/Archaeal phyloseq object- we'll see them in the Eukaryotic dataset (Or at least the owners of those mitochondria and chloroplast...)
+
+```{r}
+ML.BacArc.Filter <- ML.BacArc %>%
+    subset_taxa(
+            Family  != "Mitochondria" &
+            Class   != "Chloroplast")
+```
+
+I'm going to convert to relative abundances for some chart types. RA standing for "Relative Abundance"
+```{r}
+ML.RA.BacArc <- transform_sample_counts(ML.BacArc.Filter, function(x) x / sum(x) * 100)
+ML.RA.Euk <- transform_sample_counts(ML.Euk, function(x) x / sum(x) * 100)
+```
+
+Next, I'm going to rarefy the table for later use. I set the rarefaction depth to include all samples. 
+
+```{r}
+ML.Rare.BacArc <- rarefy_even_depth(ML.BacArc.Filter, sample.size = 1500, rngseed = 712)
+ML.Rare.Euk <- rarefy_even_depth(ML.Euk, sample.size = 400, rngseed = 712)
+```
+I need to subset the primary table to remove the incubations before proceeding. Also, I'll go ahead and make a heatmap for the incubations, and show that there was no significant difference between treatments. 
+
+```{r}
+ML.RA.WaterOnly <- subset_samples(ML.RA.BacArc, SampleName %in% c("MonoLake.SurfaceWater", "MonoLake.2m", "MonoLake.10m", "MonoLake.20m","MonoLake.25m"))
+
+ML.And.Rivers.BA.RA <- subset_samples(ML.RA.BacArc, SampleName %in% c("MonoLake.SurfaceWater", "MonoLake.2m", "MonoLake.10m", "MonoLake.20m","MonoLake.25m", "MonoLake.Sed.10m", "TomsWell.Water", "LeeViningCreek.RiverWater", "MillCreek.RiverWater", "RushCreek.RiverWater", "WilsonCreek.RiverWater"))
+
+ML.And.Rivers.Euk.RA <- subset_samples(ML.RA.Euk, SampleName %in% c("MonoLake.SurfaceWater", "MonoLake.2m", "MonoLake.10m", "MonoLake.20m","MonoLake.25m", "MonoLake.Sed.10m", "TomsWell.Water", "LeeViningCreek.RiverWater", "MillCreek.RiverWater", "RushCreek.RiverWater", "WilsonCreek.RiverWater"))
+```
+
+I'm going to define a color set to use throughout the script.
+
+```{r}
+ML.cols <- c("MonoLake.2m" = "blue", "MonoLake.10m" = "darkblue", "MonoLake.20m" = "red", "MonoLake.25m" = "Orange")
+```
+
+First up, figure 3- a heatmap of the top 25 taxa of either the Bacteria and Archaea (A), or the Eukarya (B) across the sampled depth transect at Mono, or the nearby streams and well.
+```{r,  fig.height=5, fig.width=5}
+Heatmap.BA<- amp_heatmap(data = ML.And.Rivers.BA.RA,
+            tax.aggregate = "Genus",
+           tax.add = "Phylum",
+            group = c("SampleName"),
+            tax.show = 25,
+            tax.empty = "remove",
+            plot.numbers = F,
+            plot.breaks = c(1.0,10.0,50.0),
+            max.abundance = 50,
+            min.abundance = 1,
+            order.x = c("MonoLake.SurfaceWater", "MonoLake.2m", "MonoLake.10m", "MonoLake.20m","MonoLake.25m", "MonoLake.Sed.10m", "TomsWell.Water", "LeeViningCreek.RiverWater", "MillCreek.RiverWater", "RushCreek.RiverWater", "WilsonCreek.RiverWater"),
+            scale.seq = 100) + 
+    scale_x_discrete(labels = c("Mono\nSurface","Mono\n2 m","Mono\n10 m","Mono\n20 m","Mono\n25 m","Sed.\n10m","Well\nWater", "Lee \nVining", "Mill", "Rush", "Wilson")) +
+   theme(axis.text.x = element_text(size =8, color = "black", hjust = 0.4, angle = 0, family="Times New Roman", face="bold")) + theme(axis.text.y = element_text(size =8, color = "black", angle = 0, family="Times New Roman", face="bold"))
+
+Heatmap.E<-amp_heatmap(data = ML.And.Rivers.Euk.RA,
+            tax.aggregate = "Genus",
+            tax.add = "Class",
+            group = c("SampleName"),
+            tax.show = 25,
+            tax.empty = "remove",
+            plot.numbers = F,
+            plot.breaks = c(1.0,10.0,50.0),
+            max.abundance = 50,
+            min.abundance = 1,
+            order.x = c("MonoLake.SurfaceWater", "MonoLake.2m", "MonoLake.10m", "MonoLake.20m","MonoLake.25m", "MonoLake.Sed.10m", "TomsWell.Water", "LeeViningCreek.RiverWater", "MillCreek.RiverWater", "RushCreek.RiverWater", "WilsonCreek.RiverWater"),
+            scale.seq = 100) + 
+    scale_x_discrete(labels = c("Mono\nSurface","Mono\n2 m","Mono\n10 m","Mono\n20 m","Mono\n25 m","Sed.\n10m","Well\nWater", "Lee \nVining", "Mill", "Rush", "Wilson")) +
+    theme(axis.text.x = element_text(size =8, color = "black", hjust = 0.4, angle = 0, family="Times New Roman", face="bold")) + theme(axis.text.y = element_text(size =8, color = "black", angle = 0, family="Times New Roman", face="bold"))
+
+plot_grid(Heatmap.BA,Heatmap.E, labels = c("A", "B"), rel_widths = c(1,1),nrow = 2, align = "v")
+```
+
+Now, figure 4. Again, I'll subset my dataset to now only include water samples from 2 to 25 m depth. 
+
+```{r}
+ML.BA.Rare.Transect <- subset_samples(ML.Rare.BacArc, SampleName %in% c("MonoLake.2m", "MonoLake.10m", "MonoLake.20m","MonoLake.25m"))
+ML.Euk.Rare.Transect <- subset_samples(ML.Rare.Euk, SampleName %in% c("MonoLake.2m", "MonoLake.10m", "MonoLake.20m","MonoLake.25m"))
+```
+
+Figure 4 A) Bacteria/Archaea, and B) Eukarya
+```{r, fig.height=5, fig.width=5}
+ML.BA.PCA <- ordinate(ML.BA.Rare.Transect, method = "PCoA", distance = "wunifrac")
+ML.BA.PCA <- plot_ordination(ML.BA.Rare.Transect, ML.BA.PCA, color="SampleName")
+Transect.PCA.BA<-ML.BA.PCA + scale_colour_manual(values = ML.cols) + scale_fill_manual(values = ML.cols) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+ML.Euk.PCA <- ordinate(ML.Euk.Rare.Transect, method = "PCoA", distance = "wunifrac")
+ML.Euk.PCA <- plot_ordination(ML.Euk.Rare.Transect, ML.Euk.PCA, color="SampleName")
+Transect.PCA.E<- ML.Euk.PCA + scale_colour_manual(values = ML.cols) + scale_fill_manual(values = ML.cols) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+plot_grid(Transect.PCA.BA,Transect.PCA.E, labels = c("A", "B"), rel_widths = c(1,1),nrow = 2, align = "v")
+```
+
+OK, so a clear separation between the deep (Red/Orange) samples and the more shallow (Blue) samples. We'll confirm by ADONIS in a little bit. 
+
+```{r}
+ML.BA.Rare.Data = as(sample_data(ML.BA.Rare.Transect), "data.frame")
+BA.d = phyloseq::distance(ML.BA.Rare.Transect, "wunifrac")
+ML.Euk.Rare.Data = as(sample_data(ML.Euk.Rare.Transect), "data.frame")
+Euk.d = phyloseq::distance(ML.Euk.Rare.Transect, "wunifrac")
+
+````
+
+
+```{r}
+adonis(BA.d ~ SampleName, ML.BA.Rare.Data)
+```
+Overall, highly significant with very high (> 0.90) R2 value.
+```{r}
+adonis(Euk.d ~ SampleName, ML.Euk.Rare.Data)
+```
+
+The Eukarya produce a significant, but much weaker difference between depths. This is likely driven by the high relative abundance of an OTU most closely related to Picocystis sp.
+
+------SUPPLEMENTAL------
+
+Let's see what the samples look like with chloroplast included
+```{r,  fig.height=3, fig.width=5}
+amp_heatmap(data = ML.RA.wChloroplast.BacArc,
+            tax.aggregate = "Genus",
+            tax.add = "Class",
+            group = c("SampleName"),
+            tax.show = 25,
+            tax.empty = "remove",
+            plot.numbers = T,
+            plot.breaks = c(1.0,10.0,50.0),
+            max.abundance = 50,
+            min.abundance = 1,
+            order.x = c("MonoLake.SurfaceWater", "MonoLake.2m", "MonoLake.10m", "MonoLake.20m","MonoLake.25m", "MonoLake.Sed.10m", "TomsWell.Water", "LeeViningCreek.RiverWater", "MillCreek.RiverWater", "RushCreek.RiverWater", "WilsonCreek.RiverWater"),
+            scale.seq = 100) + 
+    scale_x_discrete(labels = c("Mono\nSurface","Mono\n2 m","Mono\n10 m","Mono\n20 m","Mono\n25 m","Sed.\n10m","Well\nWater", "Lee \nVining", "Mill", "Rush", "Wilson")) +
+    theme(axis.text.x = element_text(size =8, color = "black", hjust = 0.4, angle = 0, family="Times New Roman", face="bold")) + theme(axis.text.y = element_text(size =8, color = "black", angle = 0, family="Times New Roman", face="bold"))
+```
+
+
+```{r}
+ML.BA.RA.Incubation <- subset_samples(ML.RA.BacArc, SampleName %in% c("ML..CC.Zero", "ML.CC.MeOH", "ML.CC.B", "ML.CC.NH4", "ML.CC.No", "ML.CC.G", "MonoLake.2m"))
+ML.Euk.RA.Incubation <- subset_samples(ML.RA.Euk, SampleName %in% c("ML..CC.Zero", "ML.CC.MeOH", "ML.CC.B", "ML.CC.NH4", "ML.CC.No", "ML.CC.G", "MonoLake.2m"))
+ML.BA.Rare.Incubation <- subset_samples(ML.Rare.BacArc, SampleName %in% c("ML..CC.Zero", "ML.CC.MeOH", "ML.CC.B", "ML.CC.NH4", "ML.CC.No", "ML.CC.G", "MonoLake.2m"))
+ML.Euk.Rare.Incubation <- subset_samples(ML.Rare.Euk, SampleName %in% c("ML..CC.Zero", "ML.CC.MeOH", "ML.CC.B", "ML.CC.NH4", "ML.CC.No", "ML.CC.G", "MonoLake.2m"))
+```
+
+```{r}
+inc.cols <- c("ML..CC.Zero" = "grey1", "ML.CC.MeOH" = "red", "ML.CC.B" = "red1", "ML.CC.NH4" = "orange", "ML.CC.No" = "black", "ML.CC.G" = "blue2", "MonoLake.2m" = "purple")
+```
+
+
+First I'd like to look at any differences caused by our incubations. 
+```{r, fig.height=8, fig.width=5}
+Rabund.BA<-amp_rabund(data = ML.BA.RA.Incubation,
+            tax.aggregate = "Genus",
+            tax.add = "Class",
+            group = c("SampleName"),
+            tax.show = 15,
+            tax.empty = "remove") + scale_colour_manual(values = inc.cols) + scale_fill_manual(values = inc.cols)
+
+Rabund.E<- amp_rabund(data = ML.Euk.RA.Incubation,
+            tax.aggregate = "Genus",
+            tax.add = "Class",
+            group = c("SampleName"),
+            tax.show = 5,
+            tax.empty = "remove") + scale_colour_manual(values = inc.cols) + scale_fill_manual(values = inc.cols)
+           
+
+plot_grid(Rabund.BA,Rabund.E, labels = c("A", "B"), rel_widths = c(1,1),nrow = 2, align = "v")
+```
+
+
+
+```{r}
+ML.BA.Rare.Incubation.Data = as(sample_data(ML.BA.Rare.Incubation), "data.frame")
+Incubation.BA.d = phyloseq::distance(ML.BA.Rare.Incubation, "wunifrac")
+adonis(Incubation.BA.d ~ SampleName, ML.BA.Rare.Incubation.Data)
+```
+
+
+```{r}
+Incubation.Euk.Rare.Data = as(sample_data(ML.Euk.Rare.Incubation), "data.frame")
+Incubation.Euk.d = phyloseq::distance(ML.Euk.Rare.Incubation, "wunifrac")
+adonis(Incubation.Euk.d ~ SampleName, Incubation.Euk.Rare.Data)
+```
+
+
+```{r}
+Incubation.BA.Rare.Data = as(sample_data(ML.BA.Rare.Incubation), "data.frame")
+Incubation.BA.d = phyloseq::distance(ML.BA.Rare.Incubation, "wunifrac")
+adonis(Incubation.BA.d ~ SampleName, Incubation.BA.Rare.Data)
+```
+
+Nonsignificant- not totally suprising, but we need to confirm this. Moving onto the primary data in the manuscript now. Looking at the lake itself, and the rivers that surround it. An aside from the topic of the paper, but, potentially of interest to readers- what about the rivers? Are they different? 
+
+
+```{r}
+Stream.BA.Rare <- subset_samples(ML.Rare.BacArc, SampleName %in% c("LeeViningCreek.RiverWater", "MillCreek.RiverWater", "RushCreek.RiverWater", "WilsonCreek.RiverWater"))
+Stream.Euk.Rare <- subset_samples(ML.Rare.Euk, SampleName %in% c("LeeViningCreek.RiverWater", "MillCreek.RiverWater", "RushCreek.RiverWater", "WilsonCreek.RiverWater"))
+```
+
+```{r}
+river.cols <- c("LeeViningCreek.RiverWater" = "grey1", "MillCreek.RiverWater" = "grey4", "RushCreek.RiverWater" = "blue", "WilsonCreek.RiverWater" = "orange")
+```
+
+```{r}
+Stream.BA.PCA <- ordinate(Stream.BA.Rare, method = "PCoA", distance = "wunifrac")
+Stream.BA.PCA <- plot_ordination(Stream.BA.Rare, Stream.BA.PCA, color="SampleName")
+Stream.BA.PCA + scale_colour_manual(values = river.cols) + scale_fill_manual(values = river.cols) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+The Eukaryotic communities could not be processed for the streams due to low sequence count. So, let's contiute with the bacterial/archaeal samples. 
+
+
+```{r}
+Stream.BA.Rare.Data = as(sample_data(Stream.BA.Rare), "data.frame")
+Stream.BA.d = phyloseq::distance(Stream.BA.Rare, "wunifrac")
+adonis(Stream.BA.d ~ SampleName, Stream.BA.Rare.Data)
+```
+
+Highly significant, with a strong effect size. 
+
+Finally, I'm going to produce a heatmap that was useful to see the percentages of Picocystis. 
+
+```{r,  fig.height=5, fig.width=5}
+Heatmap.BA<- amp_heatmap(data = ML.And.Rivers.BA.RA,
+            tax.aggregate = "Genus",
+           tax.add = "Phylum",
+            group = c("SampleName"),
+            tax.show = 25,
+            tax.empty = "remove",
+            plot.numbers = F,
+            plot.breaks = c(1.0,10.0,50.0),
+            max.abundance = 50,
+            min.abundance = 1,
+            order.x = c("MonoLake.SurfaceWater", "MonoLake.2m", "MonoLake.10m", "MonoLake.20m","MonoLake.25m", "MonoLake.Sed.10m", "TomsWell.Water", "LeeViningCreek.RiverWater", "MillCreek.RiverWater", "RushCreek.RiverWater", "WilsonCreek.RiverWater"),
+            scale.seq = 100) + 
+    scale_x_discrete(labels = c("Mono\nSurface","Mono\n2 m","Mono\n10 m","Mono\n20 m","Mono\n25 m","Sed.\n10m","Well\nWater", "Lee \nVining", "Mill", "Rush", "Wilson")) +
+   theme(axis.text.x = element_text(size =8, color = "black", hjust = 0.4, angle = 0, family="Times New Roman", face="bold")) + theme(axis.text.y = element_text(size =8, color = "black", angle = 0, family="Times New Roman", face="bold"))
+
+Heatmap.E<-amp_heatmap(data = ML.And.Rivers.Euk.RA,
+            tax.aggregate = "Genus",
+            tax.add = "Class",
+            group = c("SampleName"),
+            tax.show = 25,
+            tax.empty = "remove",
+            plot.numbers = T,
+            plot.breaks = c(1.0,10.0,50.0),
+            max.abundance = 50,
+            min.abundance = 1,
+            order.x = c("MonoLake.SurfaceWater", "MonoLake.2m", "MonoLake.10m", "MonoLake.20m","MonoLake.25m", "MonoLake.Sed.10m", "TomsWell.Water", "LeeViningCreek.RiverWater", "MillCreek.RiverWater", "RushCreek.RiverWater", "WilsonCreek.RiverWater"),
+            scale.seq = 100) + 
+    scale_x_discrete(labels = c("Mono\nSurface","Mono\n2 m","Mono\n10 m","Mono\n20 m","Mono\n25 m","Sed.\n10m","Well\nWater", "Lee \nVining", "Mill", "Rush", "Wilson")) +
+    theme(axis.text.x = element_text(size =8, color = "black", hjust = 0.4, angle = 0, family="Times New Roman", face="bold")) + theme(axis.text.y = element_text(size =8, color = "black", angle = 0, family="Times New Roman", face="bold"))
+
+plot_grid(Heatmap.BA,Heatmap.E, labels = c("A", "B"), rel_widths = c(1,1),nrow = 2, align = "v")
+```
